@@ -8,7 +8,7 @@ This repository represents the official implementation of the paper titled "Lear
 [Jiahao Shao*](https://jhaoshao.github.io/), Yuanbo Yang*, Hongyu Zhou, [Youmin Zhang](https://youmi-zym.github.io/),  [Yujun Shen](https://shenyujun.github.io/), [Matteo Poggi](https://mattpoggi.github.io/), [Yiyi Liao†](https://yiyiliao.github.io/ )
 
 ## 📢 News
-2024-06-11: Added <a href="https://huggingface.co/spaces/jhshao/ChronoDepth"><img src="https://img.shields.io/badge/🤗%20Hugging%20Face-Space-yellow" height="16"></a> - try it out with your images for free!<br>2024-06-11: Added <a href="https://arxiv.org/abs/2406.01493"><img src="https://img.shields.io/badge/arXiv-PDF-b31b1b" height="16"></a> paper and inference code (this repository).
+2024-06-11: Added <a href="https://huggingface.co/spaces/jhshao/ChronoDepth"><img src="https://img.shields.io/badge/🤗%20Hugging%20Face-Space-yellow" height="16"></a> - try it out with your videos for free!<br>2024-06-11: Added <a href="https://arxiv.org/abs/2406.01493"><img src="https://img.shields.io/badge/arXiv-PDF-b31b1b" height="16"></a> paper and inference code (this repository).
 
 ## 🛠️ Setup
 We test our codes under the following environment: `Ubuntu 20.04, Python 3.10.14, CUDA 11.3, RTX A6000`.
