@@ -1,0 +1,12 @@
+diffusers==0.26.0
+easydict==1.13
+einops==0.8.0
+matplotlib==3.8.4
+mediapy==1.2.2
+numpy==1.26.4
+Pillow==10.3.0
+torch==2.0.1
+torchvision==0.15.2
+tqdm==4.66.2
+accelerate==0.28.0
+transformers==4.36.2
