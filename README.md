@@ -28,7 +28,7 @@ pip install -r requirements.txt
 Run the python script `run_infer.py` as follows
 ```bash
 python run_infer.py \
-    --model_base=checkpoints/ChronoDepth \
+    --model_base=jhshao/ChronoDepth \
     --data_dir=assets/sora_e2.mp4 \
     --output_dir=./outputs \
     --num_frames=10 \
