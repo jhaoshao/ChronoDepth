@@ -1,1 +1,1 @@
-from .chronodepth_pipeline import ChronoDepthOutput, ChronoDepthPipeline
+from .chronodepth_pipeline import ChronoDepthPipeline

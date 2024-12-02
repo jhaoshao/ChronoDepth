@@ -1,103 +1,53 @@
-# Adapted from Marigold: https://github.com/prs-eth/Marigold and diffusers
-
 import inspect
 from typing import Union, Optional, List
 
 import torch
 import numpy as np
-import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
-import PIL
-from PIL import Image
-from diffusers import (
-    DiffusionPipeline,
-    EulerDiscreteScheduler,
-    UNetSpatioTemporalConditionModel,
-    AutoencoderKLTemporalDecoder,
+from diffusers.pipelines.stable_video_diffusion.pipeline_stable_video_diffusion import (
+    _resize_with_antialiasing,
+    StableVideoDiffusionPipelineOutput,
+    StableVideoDiffusionPipeline,
 )
-from diffusers.image_processor import VaeImageProcessor
-from diffusers.utils import BaseOutput
 from diffusers.utils.torch_utils import is_compiled_module, randn_tensor
-from transformers import (
-    CLIPVisionModelWithProjection,
-    CLIPImageProcessor,
-)
-from einops import rearrange, repeat
+from einops import rearrange
 
 
-class ChronoDepthOutput(BaseOutput):
-    r"""
-    Output class for zero-shot text-to-video pipeline.
+class ChronoDepthPipeline(StableVideoDiffusionPipeline):
 
-    Args:
-        frames (`[List[PIL.Image.Image]`, `np.ndarray`]):
-            List of denoised PIL images of length `batch_size` or NumPy array of shape `(batch_size, height, width,
-            num_channels)`.
-    """
-    depth_np: np.ndarray
-    depth_colored: Union[List[PIL.Image.Image], np.ndarray]
-
-
-class ChronoDepthPipeline(DiffusionPipeline):
-    model_cpu_offload_seq = "image_encoder->unet->vae"
-    _callback_tensor_inputs = ["latents"]
-    rgb_latent_scale_factor = 0.18215
-    depth_latent_scale_factor = 0.18215
-
-    def __init__(
-        self,
-        vae: AutoencoderKLTemporalDecoder,
-        image_encoder: CLIPVisionModelWithProjection,
-        unet: UNetSpatioTemporalConditionModel,
-        scheduler: EulerDiscreteScheduler,
-        feature_extractor: CLIPImageProcessor,
-    ):
-        super().__init__()
-
-        self.register_modules(
-            vae=vae,
-            image_encoder=image_encoder,
-            unet=unet,
-            scheduler=scheduler,
-            feature_extractor=feature_extractor,
-        )
-        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
-        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
-        if not hasattr(self, "dtype"):
-            self.dtype = self.unet.dtype
-
-    def encode_RGB(self,
-                   image: torch.Tensor,
+    @torch.inference_mode()
+    def encode_images(self,
+                   images: torch.Tensor,
+                   decode_chunk_size=5,
                    ):
-        video_length = image.shape[1]
-        image = rearrange(image, "b f c h w -> (b f) c h w")
-        latents = self.vae.encode(image).latent_dist.sample()
+        video_length = images.shape[1]
+        images = rearrange(images, "b f c h w -> (b f) c h w")
+        latents = []
+        for i in range(0, images.shape[0], decode_chunk_size):
+            latents_chunk = self.vae.encode(images[i : i + decode_chunk_size]).latent_dist.sample()
+            latents.append(latents_chunk)
+        latents = torch.cat(latents, dim=0)
         latents = rearrange(latents, "(b f) c h w -> b f c h w", f=video_length)
         latents = latents * self.vae.config.scaling_factor
-        
         return latents
     
-    def _encode_image(self, image, device, discard=True):
+    @torch.inference_mode()
+    def _encode_image(self, images, device, discard=True, chunk_size=14):
         '''
         set image to zero tensor discards the image embeddings if discard is True
         '''
         dtype = next(self.image_encoder.parameters()).dtype
 
-        if not isinstance(image, torch.Tensor):
-            image = self.image_processor.pil_to_numpy(image)
-            if discard:
-                image = np.zeros_like(image)
-            image = self.image_processor.numpy_to_pt(image)
+        images = _resize_with_antialiasing(images, (224, 224))
+        images = (images + 1.0) / 2.0
+        
+        if discard:
+            images = torch.zeros_like(images)
 
-            # We normalize the image before resizing to match with the original implementation.
-            # Then we unnormalize it after resizing.
-            image = image * 2.0 - 1.0
-            image = _resize_with_antialiasing(image, (224, 224))
-            image = (image + 1.0) / 2.0
-
-            # Normalize the image with for CLIP input
-            image = self.feature_extractor(
-                images=image,
+        image_embeddings = []
+        for i in range(0, images.shape[0], chunk_size):
+            tmp = self.feature_extractor(
+                images=images[i : i + chunk_size],
                 do_normalize=True,
                 do_center_crop=False,
                 do_resize=False,
@@ -105,9 +55,10 @@ class ChronoDepthPipeline(DiffusionPipeline):
                 return_tensors="pt",
             ).pixel_values
 
-        image = image.to(device=device, dtype=dtype)
-        image_embeddings = self.image_encoder(image).image_embeds
-        image_embeddings = image_embeddings.unsqueeze(1)
+            tmp = tmp.to(device=device, dtype=dtype)
+            image_embeddings.append(self.image_encoder(tmp).image_embeds)
+        image_embeddings = torch.cat(image_embeddings, dim=0)
+        image_embeddings = image_embeddings.unsqueeze(1) # [t, 1, 1024]
 
         return image_embeddings
     
@@ -137,138 +88,75 @@ class ChronoDepthPipeline(DiffusionPipeline):
         
         return depth_mean
 
-    def _get_add_time_ids(self,
-                          fps,
-                          motion_bucket_id,
-                          noise_aug_strength,
-                          dtype,
-                          batch_size,
-                          ):
-        add_time_ids = [fps, motion_bucket_id, noise_aug_strength]
-
-        passed_add_embed_dim = self.unet.config.addition_time_embed_dim * \
-            len(add_time_ids)
-        expected_add_embed_dim = self.unet.add_embedding.linear_1.in_features
-
-        if expected_add_embed_dim != passed_add_embed_dim:
-            raise ValueError(
-                f"Model expects an added time embedding vector of length {expected_add_embed_dim}, but a vector of {passed_add_embed_dim} was created. The model has an incorrect config. Please check `unet.config.time_embedding_type` and `text_encoder_2.config.projection_dim`."
-            )
-
-        add_time_ids = torch.tensor([add_time_ids], dtype=dtype)
-        add_time_ids = add_time_ids.repeat(batch_size, 1)
-        return add_time_ids
-
-    def decode_latents(self, latents, num_frames, decode_chunk_size=14):
-        # [batch, frames, channels, height, width] -> [batch*frames, channels, height, width]
-        latents = latents.flatten(0, 1)
-
-        latents = 1 / self.vae.config.scaling_factor * latents
-
-        forward_vae_fn = self.vae._orig_mod.forward if is_compiled_module(self.vae) else self.vae.forward
-        accepts_num_frames = "num_frames" in set(inspect.signature(forward_vae_fn).parameters.keys())
-
-        # decode decode_chunk_size frames at a time to avoid OOM
-        frames = []
-        for i in range(0, latents.shape[0], decode_chunk_size):
-            num_frames_in = latents[i : i + decode_chunk_size].shape[0]
-            decode_kwargs = {}
-            if accepts_num_frames:
-                # we only pass num_frames_in if it's expected
-                decode_kwargs["num_frames"] = num_frames_in
-
-            frame = self.vae.decode(latents[i : i + decode_chunk_size], **decode_kwargs).sample
-            frames.append(frame)
-        frames = torch.cat(frames, dim=0)
-
-        # [batch*frames, channels, height, width] -> [batch, channels, frames, height, width]
-        frames = frames.reshape(-1, num_frames, *frames.shape[1:]).permute(0, 2, 1, 3, 4)
-
-        # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
-        frames = frames.float()
-        return frames
-
-    def check_inputs(self, image, height, width):
+    @staticmethod
+    def check_inputs(images, height, width):
         if (
-            not isinstance(image, torch.Tensor)
-            and not isinstance(image, PIL.Image.Image)
-            and not isinstance(image, list)
+            not isinstance(images, torch.Tensor)
+            and not isinstance(images, np.ndarray)
         ):
             raise ValueError(
-                "`image` has to be of type `torch.FloatTensor` or `PIL.Image.Image` or `List[PIL.Image.Image]` but is"
-                f" {type(image)}"
+                "`images` has to be of type `torch.Tensor` or `numpy.ndarray` but is"
+                f" {type(images)}"
             )
 
         if height % 64 != 0 or width % 64 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
 
-    def prepare_latents(
-        self,
-        shape,
-        dtype,
-        device,
-        generator,
-        latent=None,
-    ):
-        if isinstance(generator, list) and len(generator) != shape[0]:
-            raise ValueError(
-                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
-                f" size of {shape[0]}. Make sure the batch size matches the length of the generators."
-            )
-
-        if latent is None:
-            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-        else:
-            latents = latents.to(device)
-
-        # scale the initial noise by the standard deviation required by the scheduler
-        latents = latents * self.scheduler.init_noise_sigma
-        return latents
-
-    @property
-    def num_timesteps(self):
-        return self._num_timesteps
-
     @torch.no_grad()
     def __call__(
         self,
-        input_image: Union[List[PIL.Image.Image], torch.FloatTensor],
+        input_images: Union[np.ndarray, torch.FloatTensor],
         height: int = 576,
         width: int = 768,
-        num_frames: Optional[int] = None,
         num_inference_steps: int = 10,
         fps: int = 7,
         motion_bucket_id: int = 127,
         noise_aug_strength: float = 0.02,
         decode_chunk_size: Optional[int] = None,
-        color_map: str="Spectral",
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         show_progress_bar: bool = True,
-        match_input_res: bool = True,
-        depth_pred_last: Optional[torch.FloatTensor] = None,
+        latents: Optional[torch.Tensor] = None,
+        infer_mode: str = 'ours',
+        sigma_epsilon: float = -4,
     ):
+        """
+        Args:
+            input_images: shape [T, H, W, 3] if np.ndarray or [T, 3, H, W] if torch.FloatTensor, range [0, 1]
+            height: int, height of the input image
+            width: int, width of the input image
+            num_inference_steps: int, number of inference steps
+            fps: int, frames per second
+            motion_bucket_id: int, motion bucket id
+            noise_aug_strength: float, noise augmentation strength
+            decode_chunk_size: int, decode chunk size
+            generator: torch.Generator or List[torch.Generator], random number generator
+            show_progress_bar: bool, show progress bar
+        """
         assert height >= 0 and width >=0
         assert num_inference_steps >=1
 
-        num_frames = num_frames if num_frames is not None else self.unet.config.num_frames
-        decode_chunk_size = decode_chunk_size if decode_chunk_size is not None else num_frames
+        decode_chunk_size = decode_chunk_size if decode_chunk_size is not None else 8
 
         # 1. Check inputs. Raise error if not correct
-        self.check_inputs(input_image, height, width)
+        self.check_inputs(input_images, height, width)
 
         # 2. Define call parameters
-        if isinstance(input_image, list):
-            batch_size = 1
-            input_size = input_image[0].size
-        elif isinstance(input_image, torch.Tensor):
-            batch_size = input_image.shape[0]
-            input_size = input_image.shape[:-3:-1]
-        assert batch_size == 1, "Batch size must be 1 for now"
+        batch_size = 1 # only support batch size 1 for now
         device = self._execution_device
 
         # 3. Encode input image
-        image_embeddings = self._encode_image(input_image[0], device)
-        image_embeddings = image_embeddings.repeat((batch_size, 1, 1))
+        if isinstance(input_images, np.ndarray):
+            input_images = torch.from_numpy(input_images.transpose(0, 3, 1, 2))
+        else:
+            assert isinstance(input_images, torch.Tensor)
+        input_images = input_images.to(device=device)
+        input_images = input_images * 2.0 - 1.0  # [0,1] -> [-1,1], in [t, c, h, w]
+        
+        discard_clip_features = True
+        image_embeddings = self._encode_image(input_images, device, 
+                                              discard=discard_clip_features,
+                                              chunk_size=decode_chunk_size
+                                              )
 
         # NOTE: Stable Diffusion Video was conditioned on fps - 1, which
         # is why it is reduced here.
@@ -276,19 +164,10 @@ class ChronoDepthPipeline(DiffusionPipeline):
         fps = fps - 1
 
         # 4. Encode input image using VAE
-        input_image = self.image_processor.preprocess(input_image, height=height, width=width).to(device)
-        assert input_image.min() >= -1.0 and input_image.max() <= 1.0
-        noise = randn_tensor(input_image.shape, generator=generator, device=device, dtype=input_image.dtype)
-        input_image = input_image + noise_aug_strength * noise
-        if depth_pred_last is not None:
-            depth_pred_last = depth_pred_last.to(device)
-            # resize depth
-            from torchvision.transforms import InterpolationMode
-            from torchvision.transforms.functional import resize
-            depth_pred_last = resize(depth_pred_last.unsqueeze(1), (height, width), InterpolationMode.NEAREST_EXACT, antialias=True)
-            depth_pred_last = repeat(depth_pred_last, 'f c h w ->b f c h w', b=batch_size)
-
-        rgb_batch = repeat(input_image, 'f c h w ->b f c h w', b=batch_size)
+        noise = randn_tensor(input_images.shape, generator=generator, device=device, dtype=input_images.dtype)
+        input_images = input_images + noise_aug_strength * noise
+        
+        rgb_batch = input_images.unsqueeze(0)
 
         added_time_ids = self._get_add_time_ids(
             fps,
@@ -296,75 +175,78 @@ class ChronoDepthPipeline(DiffusionPipeline):
             noise_aug_strength,
             image_embeddings.dtype,
             batch_size,
+            1, # do not modify this! 
+            False, # do not modify this! 
         )
         added_time_ids = added_time_ids.to(device)
 
-        depth_pred_raw = self.single_infer(rgb_batch, 
-                                           image_embeddings,
-                                           added_time_ids,
-                                           num_inference_steps,
-                                           show_progress_bar,
-                                           generator,
-                                           depth_pred_last=depth_pred_last,
-                                           decode_chunk_size=decode_chunk_size)
-        
-        depth_colored_img_list = []
-        depth_frames = []
-        for i in range(num_frames):
-            depth_frame = depth_pred_raw[:, i].squeeze()
-        
-            # Convert to numpy
-            depth_frame = depth_frame.cpu().numpy().astype(np.float32)
+        if infer_mode == 'ours':
+            depth_pred_raw = self.single_infer_ours(
+                rgb_batch, 
+                image_embeddings,
+                added_time_ids,
+                num_inference_steps,
+                show_progress_bar,
+                generator,
+                decode_chunk_size=decode_chunk_size,
+                latents=latents,
+                sigma_epsilon=sigma_epsilon,
+            )
+        elif infer_mode == 'replacement':
+            depth_pred_raw = self.single_infer_replacement(
+                rgb_batch, 
+                image_embeddings,
+                added_time_ids,
+                num_inference_steps,
+                show_progress_bar,
+                generator,
+                decode_chunk_size=decode_chunk_size,
+                latents=latents,
+            )
+        elif infer_mode == 'naive':
+            depth_pred_raw = self.single_infer_naive_sliding_window(
+                rgb_batch, 
+                image_embeddings,
+                added_time_ids,
+                num_inference_steps,
+                show_progress_bar,
+                generator,
+                decode_chunk_size=decode_chunk_size,
+                latents=latents,
+            )
 
-            if match_input_res:
-                pred_img = Image.fromarray(depth_frame)
-                pred_img = pred_img.resize(input_size, resample=Image.NEAREST)
-                depth_frame = np.asarray(pred_img)
-
-            # Clip output range: current size is the original size
-            depth_frame = depth_frame.clip(0, 1)
         
-            # Colorize
-            depth_colored = plt.get_cmap(color_map)(depth_frame, bytes=True)[..., :3]
-            depth_colored_img = Image.fromarray(depth_colored)
-            
-            depth_colored_img_list.append(depth_colored_img)
-            depth_frames.append(depth_frame)
-        
-        depth_frame = np.stack(depth_frames)
+        depth_frames = depth_pred_raw.cpu().numpy().astype(np.float32)
 
         self.maybe_free_model_hooks()
 
-        return ChronoDepthOutput(
-            depth_np = depth_frames,
-            depth_colored = depth_colored_img_list,
+        return StableVideoDiffusionPipelineOutput(
+            frames = depth_frames,
         )
 
     @torch.no_grad()
-    def single_infer(self,
+    def single_infer_ours(self,
                      input_rgb: torch.Tensor,
                      image_embeddings: torch.Tensor,
                      added_time_ids: torch.Tensor,
                      num_inference_steps: int,
                      show_pbar: bool,
                      generator: Optional[Union[torch.Generator, List[torch.Generator]]],
-                     depth_pred_last: Optional[torch.Tensor] = None,
                      decode_chunk_size=1,
+                     latents: Optional[torch.Tensor] = None,
+                     sigma_epsilon: float = -4,
                      ):
         device = input_rgb.device
+        H, W = input_rgb.shape[-2:]
 
         needs_upcasting = self.vae.dtype == torch.float16 and self.vae.config.force_upcast
         if needs_upcasting:
             self.vae.to(dtype=torch.float32)
 
-        rgb_latent = self.encode_RGB(input_rgb)
+        rgb_latent = self.encode_images(input_rgb)
         rgb_latent = rgb_latent.to(image_embeddings.dtype)
-        if depth_pred_last is not None:
-            depth_pred_last = depth_pred_last.repeat(1, 1, 3, 1, 1)
-            depth_pred_last_latent = self.encode_RGB(depth_pred_last)
-            depth_pred_last_latent = depth_pred_last_latent.to(image_embeddings.dtype)
-        else:
-            depth_pred_last_latent = None
+        
+        torch.cuda.empty_cache()
         
         # cast back to fp16 if needed
         if needs_upcasting:
@@ -374,43 +256,108 @@ class ChronoDepthPipeline(DiffusionPipeline):
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
 
-        depth_latent = self.prepare_latents(
-            rgb_latent.shape,
-            image_embeddings.dtype,
-            device,
-            generator
-        )
+        batch_size, n_frames, _, _, _ = rgb_latent.shape
+        num_channels_latents = self.unet.config.in_channels
 
-        if show_pbar:
-            iterable = tqdm(
-                enumerate(timesteps),
-                total=len(timesteps),
-                leave=False,
-                desc=" " * 4 + "Diffusion denoising",
+        curr_frame = 0
+        depth_latent = torch.tensor([], dtype=image_embeddings.dtype, device=device)
+        pbar = tqdm(total=n_frames, initial=curr_frame, desc="Sampling")
+
+        # first chunk
+        horizon = min(n_frames-curr_frame, self.n_tokens)
+        start_frame = 0
+        chunk = self.prepare_latents(
+                batch_size,
+                horizon,
+                num_channels_latents,
+                H,
+                W,
+                image_embeddings.dtype,
+                device,
+                generator,
+                latents,
             )
+        depth_latent = torch.cat([depth_latent, chunk], 1)
+        if show_pbar:
+                iterable = tqdm(
+                    enumerate(timesteps),
+                    total=len(timesteps),
+                    leave=False,
+                    desc=" " * 4 + "Diffusion denoising first chunk",
+                )   
         else:
             iterable = enumerate(timesteps)
-        
-        for i, t in iterable:
-            if depth_pred_last_latent is not None:
-                known_frames_num = depth_pred_last_latent.shape[1]
-                epsilon = randn_tensor(
-                    depth_pred_last_latent.shape, 
-                    generator=generator, 
-                    device=device, 
-                    dtype=image_embeddings.dtype
-                    )
-                depth_latent[:, :known_frames_num] = depth_pred_last_latent + epsilon * self.scheduler.sigmas[i]
-            depth_latent = self.scheduler.scale_model_input(depth_latent, t)
-            unet_input = torch.cat([rgb_latent, depth_latent], dim=2)
-            
-            noise_pred = self.unet(
-                unet_input, t, image_embeddings, added_time_ids=added_time_ids
-            )[0]
 
-            # compute the previous noisy sample x_t -> x_t-1
-            depth_latent = self.scheduler.step(noise_pred, t, depth_latent).prev_sample
+        for i, t in iterable:
+            curr_timesteps = torch.tensor([t]*horizon).to(device)
+            depth_latent = self.scheduler.scale_model_input(depth_latent, t)
+            noise_pred = self.unet(
+                torch.cat([rgb_latent[:, start_frame:curr_frame+horizon], depth_latent[:, start_frame:]], dim=2), 
+                curr_timesteps[start_frame:],
+                image_embeddings[start_frame:curr_frame+horizon],
+                added_time_ids=added_time_ids
+            )[0]
+            depth_latent[:, curr_frame:] = self.scheduler.step(noise_pred[:,-horizon:], t, depth_latent[:, curr_frame:]).prev_sample
         
+        self.scheduler._step_index = None
+        curr_frame += horizon
+        pbar.update(horizon)
+        
+        while curr_frame < n_frames:
+            if self.chunk_size > 0:
+                horizon = min(n_frames - curr_frame, self.chunk_size)
+            else:
+                horizon = min(n_frames - curr_frame, self.n_tokens)
+            assert horizon <= self.n_tokens, "horizon exceeds the number of tokens."
+            chunk = self.prepare_latents(
+                batch_size, 
+                horizon, 
+                num_channels_latents,
+                H,
+                W,
+                image_embeddings.dtype,
+                device,
+                generator,
+                latents,
+            )
+            depth_latent = torch.cat([depth_latent, chunk], 1)
+            start_frame = max(0, curr_frame + horizon - self.n_tokens)
+
+            pbar.set_postfix(
+                {
+                    "start": start_frame,
+                    "end": curr_frame + horizon,
+                }
+            )
+
+            if show_pbar:
+                iterable = tqdm(
+                    enumerate(timesteps),
+                    total=len(timesteps),
+                    leave=False,
+                    desc=" " * 4 + "Diffusion denoising ",
+                )   
+            else:
+                iterable = enumerate(timesteps)
+
+            for i, t in iterable:
+                t_horizon = torch.tensor([t]*horizon).to(device)
+                # t_context = timesteps[-1] * torch.ones((curr_frame,), dtype=t.dtype).to(device)
+                t_context = sigma_epsilon * torch.ones((curr_frame,), dtype=t.dtype).to(device)
+                curr_timesteps = torch.concatenate((t_context, t_horizon), 0)
+                depth_latent[:, curr_frame:] = self.scheduler.scale_model_input(depth_latent[:, curr_frame:], t)
+                noise_pred = self.unet(
+                    torch.cat([rgb_latent[:, start_frame:curr_frame+horizon], depth_latent[:, start_frame:]], dim=2), 
+                    curr_timesteps[start_frame:],
+                    image_embeddings[start_frame:curr_frame+horizon],
+                    added_time_ids=added_time_ids
+                )[0]
+                depth_latent[:, curr_frame:] = self.scheduler.step(noise_pred[:,-horizon:], t, depth_latent[:, curr_frame:]).prev_sample
+            
+            self.scheduler._step_index = None
+            curr_frame += horizon
+            pbar.update(horizon)
+
         torch.cuda.empty_cache()
         if needs_upcasting:
             self.vae.to(dtype=torch.float16)
@@ -420,111 +367,296 @@ class ChronoDepthPipeline(DiffusionPipeline):
         # shift to [0, 1]
         depth = (depth + 1.0) / 2.0
 
-        return depth
+        return depth.squeeze(0)
     
-# resizing utils
-def _resize_with_antialiasing(input, size, interpolation="bicubic", align_corners=True):
-    h, w = input.shape[-2:]
-    factors = (h / size[0], w / size[1])
+    @torch.no_grad()
+    def single_infer_replacement(self,
+                     input_rgb: torch.Tensor,
+                     image_embeddings: torch.Tensor,
+                     added_time_ids: torch.Tensor,
+                     num_inference_steps: int,
+                     show_pbar: bool,
+                     generator: Optional[Union[torch.Generator, List[torch.Generator]]],
+                     decode_chunk_size=1,
+                     latents: Optional[torch.Tensor] = None,
+                     ):
+        device = input_rgb.device
+        H, W = input_rgb.shape[-2:]
 
-    # First, we have to determine sigma
-    # Taken from skimage: https://github.com/scikit-image/scikit-image/blob/v0.19.2/skimage/transform/_warps.py#L171
-    sigmas = (
-        max((factors[0] - 1.0) / 2.0, 0.001),
-        max((factors[1] - 1.0) / 2.0, 0.001),
-    )
+        needs_upcasting = self.vae.dtype == torch.float16 and self.vae.config.force_upcast
+        if needs_upcasting:
+            self.vae.to(dtype=torch.float32)
 
-    # Now kernel size. Good results are for 3 sigma, but that is kind of slow. Pillow uses 1 sigma
-    # https://github.com/python-pillow/Pillow/blob/master/src/libImaging/Resample.c#L206
-    # But they do it in the 2 passes, which gives better results. Let's try 2 sigmas for now
-    ks = int(max(2.0 * 2 * sigmas[0], 3)), int(max(2.0 * 2 * sigmas[1], 3))
+        rgb_latent = self.encode_images(input_rgb)
+        rgb_latent = rgb_latent.to(image_embeddings.dtype)
+        
+        torch.cuda.empty_cache()
+        
+        # cast back to fp16 if needed
+        if needs_upcasting:
+            self.vae.to(dtype=torch.float16)
 
-    # Make sure it is odd
-    if (ks[0] % 2) == 0:
-        ks = ks[0] + 1, ks[1]
+        # Prepare timesteps
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = self.scheduler.timesteps
 
-    if (ks[1] % 2) == 0:
-        ks = ks[0], ks[1] + 1
+        batch_size, n_frames, _, _, _ = rgb_latent.shape
+        num_channels_latents = self.unet.config.in_channels
 
-    input = _gaussian_blur2d(input, ks, sigmas)
+        curr_frame = 0
+        depth_latent = torch.tensor([], dtype=image_embeddings.dtype, device=device)
+        pbar = tqdm(total=n_frames, initial=curr_frame, desc="Sampling")
 
-    output = torch.nn.functional.interpolate(input, size=size, mode=interpolation, align_corners=align_corners)
-    return output
+        # first chunk
+        horizon = min(n_frames-curr_frame, self.n_tokens)
+        start_frame = 0
+        chunk = self.prepare_latents(
+                batch_size,
+                horizon,
+                num_channels_latents,
+                H,
+                W,
+                image_embeddings.dtype,
+                device,
+                generator,
+                latents,
+            )
+        depth_latent = torch.cat([depth_latent, chunk], 1)
+        if show_pbar:
+                iterable = tqdm(
+                    enumerate(timesteps),
+                    total=len(timesteps),
+                    leave=False,
+                    desc=" " * 4 + "Diffusion denoising first chunk",
+                )   
+        else:
+            iterable = enumerate(timesteps)
 
+        for i, t in iterable:
+            curr_timesteps = torch.tensor([t]*horizon).to(device)
+            depth_latent = self.scheduler.scale_model_input(depth_latent, t)
+            noise_pred = self.unet(
+                torch.cat([rgb_latent[:, start_frame:curr_frame+horizon], depth_latent[:, start_frame:]], dim=2), 
+                curr_timesteps[start_frame:],
+                image_embeddings[start_frame:curr_frame+horizon],
+                added_time_ids=added_time_ids
+            )[0]
+            depth_latent[:, curr_frame:] = self.scheduler.step(noise_pred[:,-horizon:], t, depth_latent[:, curr_frame:]).prev_sample
+        
+        self.scheduler._step_index = None
+        curr_frame += horizon
+        pbar.update(horizon)
+        
+        while curr_frame < n_frames:
+            if self.chunk_size > 0:
+                horizon = min(n_frames - curr_frame, self.chunk_size)
+            else:
+                horizon = min(n_frames - curr_frame, self.n_tokens)
+            assert horizon <= self.n_tokens, "horizon exceeds the number of tokens."
+            chunk = self.prepare_latents(
+                batch_size, 
+                horizon, 
+                num_channels_latents,
+                H,
+                W,
+                image_embeddings.dtype,
+                device,
+                generator,
+                latents,
+            )
+            depth_latent = torch.cat([depth_latent, chunk], 1)
+            start_frame = max(0, curr_frame + horizon - self.n_tokens)
+            depth_pred_last_latent = depth_latent[:, start_frame:curr_frame].clone()
 
-def _compute_padding(kernel_size):
-    """Compute padding tuple."""
-    # 4 or 6 ints:  (padding_left, padding_right,padding_top,padding_bottom)
-    # https://pytorch.org/docs/stable/nn.html#torch.nn.functional.pad
-    if len(kernel_size) < 2:
-        raise AssertionError(kernel_size)
-    computed = [k - 1 for k in kernel_size]
+            pbar.set_postfix(
+                {
+                    "start": start_frame,
+                    "end": curr_frame + horizon,
+                }
+            )
 
-    # for even kernels we need to do asymmetric padding :(
-    out_padding = 2 * len(kernel_size) * [0]
+            if show_pbar:
+                iterable = tqdm(
+                    enumerate(timesteps),
+                    total=len(timesteps),
+                    leave=False,
+                    desc=" " * 4 + "Diffusion denoising ",
+                )   
+            else:
+                iterable = enumerate(timesteps)
 
-    for i in range(len(kernel_size)):
-        computed_tmp = computed[-(i + 1)]
+            for i, t in iterable:
+                curr_timesteps = torch.tensor([t]*(curr_frame+horizon-start_frame)).to(device)
+                epsilon = randn_tensor(
+                    depth_pred_last_latent.shape, 
+                    generator=generator, 
+                    device=device, 
+                    dtype=image_embeddings.dtype
+                )
+                depth_latent[:, start_frame:curr_frame] = depth_pred_last_latent + epsilon * self.scheduler.sigmas[i]
+                depth_latent[:, start_frame:] = self.scheduler.scale_model_input(depth_latent[:, start_frame:], t)
+                noise_pred = self.unet(
+                    torch.cat([rgb_latent[:, start_frame:curr_frame+horizon], depth_latent[:, start_frame:]], dim=2), 
+                    curr_timesteps,
+                    image_embeddings[start_frame:curr_frame+horizon],
+                    added_time_ids=added_time_ids
+                )[0]
+                depth_latent[:, start_frame:] = self.scheduler.step(noise_pred, t, depth_latent[:, start_frame:]).prev_sample
+            
+            depth_latent[:, start_frame:curr_frame] = depth_pred_last_latent
+            self.scheduler._step_index = None
+            curr_frame += horizon
+            pbar.update(horizon)
 
-        pad_front = computed_tmp // 2
-        pad_rear = computed_tmp - pad_front
+        torch.cuda.empty_cache()
+        if needs_upcasting:
+            self.vae.to(dtype=torch.float16)
+        depth = self.decode_depth(depth_latent, decode_chunk_size=decode_chunk_size)
+        # clip prediction
+        depth = torch.clip(depth, -1.0, 1.0)
+        # shift to [0, 1]
+        depth = (depth + 1.0) / 2.0
 
-        out_padding[2 * i + 0] = pad_front
-        out_padding[2 * i + 1] = pad_rear
+        return depth.squeeze(0)
+    
+    @torch.no_grad()
+    def single_infer_naive_sliding_window(self,
+                     input_rgb: torch.Tensor,
+                     image_embeddings: torch.Tensor,
+                     added_time_ids: torch.Tensor,
+                     num_inference_steps: int,
+                     show_pbar: bool,
+                     generator: Optional[Union[torch.Generator, List[torch.Generator]]],
+                     decode_chunk_size=1,
+                     latents: Optional[torch.Tensor] = None,
+                     ):
+        device = input_rgb.device
+        H, W = input_rgb.shape[-2:]
 
-    return out_padding
+        needs_upcasting = self.vae.dtype == torch.float16 and self.vae.config.force_upcast
+        if needs_upcasting:
+            self.vae.to(dtype=torch.float32)
 
+        rgb_latent = self.encode_images(input_rgb)
+        rgb_latent = rgb_latent.to(image_embeddings.dtype)
+        
+        torch.cuda.empty_cache()
+        
+        # cast back to fp16 if needed
+        if needs_upcasting:
+            self.vae.to(dtype=torch.float16)
 
-def _filter2d(input, kernel):
-    # prepare kernel
-    b, c, h, w = input.shape
-    tmp_kernel = kernel[:, None, ...].to(device=input.device, dtype=input.dtype)
+        # Prepare timesteps
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = self.scheduler.timesteps
 
-    tmp_kernel = tmp_kernel.expand(-1, c, -1, -1)
+        batch_size, n_frames, _, _, _ = rgb_latent.shape
+        num_channels_latents = self.unet.config.in_channels
 
-    height, width = tmp_kernel.shape[-2:]
+        curr_frame = 0
+        depth_latent = torch.tensor([], dtype=image_embeddings.dtype, device=device)
+        pbar = tqdm(total=n_frames, initial=curr_frame, desc="Sampling")
 
-    padding_shape: list[int] = _compute_padding([height, width])
-    input = torch.nn.functional.pad(input, padding_shape, mode="reflect")
+        # first chunk
+        horizon = min(n_frames-curr_frame, self.n_tokens)
+        start_frame = 0
+        chunk = self.prepare_latents(
+                batch_size,
+                horizon,
+                num_channels_latents,
+                H,
+                W,
+                image_embeddings.dtype,
+                device,
+                generator,
+                latents,
+            )
+        depth_latent = torch.cat([depth_latent, chunk], 1)
+        if show_pbar:
+                iterable = tqdm(
+                    enumerate(timesteps),
+                    total=len(timesteps),
+                    leave=False,
+                    desc=" " * 4 + "Diffusion denoising first chunk",
+                )   
+        else:
+            iterable = enumerate(timesteps)
 
-    # kernel and input tensor reshape to align element-wise or batch-wise params
-    tmp_kernel = tmp_kernel.reshape(-1, 1, height, width)
-    input = input.view(-1, tmp_kernel.size(0), input.size(-2), input.size(-1))
+        for i, t in iterable:
+            curr_timesteps = torch.tensor([t]*horizon).to(device)
+            depth_latent = self.scheduler.scale_model_input(depth_latent, t)
+            noise_pred = self.unet(
+                torch.cat([rgb_latent[:, start_frame:curr_frame+horizon], depth_latent[:, start_frame:]], dim=2), 
+                curr_timesteps[start_frame:],
+                image_embeddings[start_frame:curr_frame+horizon],
+                added_time_ids=added_time_ids
+            )[0]
+            depth_latent[:, curr_frame:] = self.scheduler.step(noise_pred[:,-horizon:], t, depth_latent[:, curr_frame:]).prev_sample
+        
+        self.scheduler._step_index = None
+        curr_frame += horizon
+        pbar.update(horizon)
+        
+        while curr_frame < n_frames:
+            if self.chunk_size > 0:
+                horizon = min(n_frames - curr_frame, self.chunk_size)
+            else:
+                horizon = min(n_frames - curr_frame, self.n_tokens)
+            assert horizon <= self.n_tokens, "horizon exceeds the number of tokens."
+            start_frame = max(0, curr_frame + horizon - self.n_tokens)
 
-    # convolve the tensor with the kernel.
-    output = torch.nn.functional.conv2d(input, tmp_kernel, groups=tmp_kernel.size(0), padding=0, stride=1)
+            chunk = self.prepare_latents(
+                batch_size, 
+                curr_frame+horizon-start_frame, 
+                num_channels_latents,
+                H,
+                W,
+                image_embeddings.dtype,
+                device,
+                generator,
+                latents,
+            )
 
-    out = output.view(b, c, h, w)
-    return out
+            pbar.set_postfix(
+                {
+                    "start": start_frame,
+                    "end": curr_frame + horizon,
+                }
+            )
 
+            if show_pbar:
+                iterable = tqdm(
+                    enumerate(timesteps),
+                    total=len(timesteps),
+                    leave=False,
+                    desc=" " * 4 + "Diffusion denoising ",
+                )   
+            else:
+                iterable = enumerate(timesteps)
 
-def _gaussian(window_size: int, sigma):
-    if isinstance(sigma, float):
-        sigma = torch.tensor([[sigma]])
+            for i, t in iterable:
+                curr_timesteps = torch.tensor([t]*(curr_frame+horizon-start_frame)).to(device)
+                chunk = self.scheduler.scale_model_input(chunk, t)
+                noise_pred = self.unet(
+                    torch.cat([rgb_latent[:, start_frame:curr_frame+horizon], chunk], dim=2), 
+                    curr_timesteps,
+                    image_embeddings[start_frame:curr_frame+horizon],
+                    added_time_ids=added_time_ids
+                )[0]
+                chunk = self.scheduler.step(noise_pred, t, chunk).prev_sample
+            
+            depth_latent = torch.cat([depth_latent, chunk[:, -horizon:]], 1)
+            self.scheduler._step_index = None
+            curr_frame += horizon
+            pbar.update(horizon)
 
-    batch_size = sigma.shape[0]
+        torch.cuda.empty_cache()
+        if needs_upcasting:
+            self.vae.to(dtype=torch.float16)
+        depth = self.decode_depth(depth_latent, decode_chunk_size=decode_chunk_size)
+        # clip prediction
+        depth = torch.clip(depth, -1.0, 1.0)
+        # shift to [0, 1]
+        depth = (depth + 1.0) / 2.0
 
-    x = (torch.arange(window_size, device=sigma.device, dtype=sigma.dtype) - window_size // 2).expand(batch_size, -1)
-
-    if window_size % 2 == 0:
-        x = x + 0.5
-
-    gauss = torch.exp(-x.pow(2.0) / (2 * sigma.pow(2.0)))
-
-    return gauss / gauss.sum(-1, keepdim=True)
-
-
-def _gaussian_blur2d(input, kernel_size, sigma):
-    if isinstance(sigma, tuple):
-        sigma = torch.tensor([sigma], dtype=input.dtype)
-    else:
-        sigma = sigma.to(dtype=input.dtype)
-
-    ky, kx = int(kernel_size[0]), int(kernel_size[1])
-    bs = sigma.shape[0]
-    kernel_x = _gaussian(kx, sigma[:, 1].view(bs, 1))
-    kernel_y = _gaussian(ky, sigma[:, 0].view(bs, 1))
-    out_x = _filter2d(input, kernel_x[..., None, :])
-    out = _filter2d(out_x, kernel_y[..., None])
-
-    return out
+        return depth.squeeze(0)

@@ -2,16 +2,18 @@
 
 This repository represents the official implementation of the paper titled "Learning Temporally Consistent Video Depth from Video Diffusion Priors".
 
-[![Website](https://img.shields.io/website?url=https%3A%2F%2Fjhaoshao.github.io%2FChronoDepth%2F&up_message=ChronoDepth&up_color=blue&style=flat&logo=timescale&logoColor=%23FFDC0F)](https://jhaoshao.github.io/ChronoDepth/) [![Paper](https://img.shields.io/badge/arXiv-PDF-b31b1b)](https://arxiv.org/abs/2406.01493) [![Hugging Face Space](https://img.shields.io/badge/🤗%20Hugging%20Face-Space-yellow)](https://huggingface.co/spaces/jhshao/ChronoDepth)
-[![Hugging Face Model](https://img.shields.io/badge/🤗%20Hugging%20Face-Model-green)](https://huggingface.co/jhshao/ChronoDepth)
+[![Website](https://img.shields.io/website?url=https%3A%2F%2Fjhaoshao.github.io%2FChronoDepth%2F&up_message=ChronoDepth&up_color=blue&style=flat&logo=timescale&logoColor=%23FFDC0F)](https://xdimlab.github.io/ChronoDepth/) [![Paper](https://img.shields.io/badge/arXiv-PDF-b31b1b)](https://arxiv.org/abs/2406.01493) [![Hugging Face Space](https://img.shields.io/badge/🤗%20Hugging%20Face-Space-yellow)](https://huggingface.co/spaces/jhshao/ChronoDepth)
+[![Hugging Face Model](https://img.shields.io/badge/🤗%20Hugging%20Face-Model-green)](https://huggingface.co/jhshao/ChronoDepth-v1)
 
-[Jiahao Shao*](https://jhaoshao.github.io/), Yuanbo Yang*, Hongyu Zhou, [Youmin Zhang](https://youmi-zym.github.io/),  [Yujun Shen](https://shenyujun.github.io/), [Matteo Poggi](https://mattpoggi.github.io/), [Yiyi Liao†](https://yiyiliao.github.io/ )
+[Jiahao Shao*](https://jhaoshao.github.io/), Yuanbo Yang*, Hongyu Zhou, [Youmin Zhang](https://youmi-zym.github.io/),  [Yujun Shen](https://shenyujun.github.io/), [Vitor Guizilini](https://vitorguizilini.github.io/), [Yue Wang](https://yuewang.xyz/), [Matteo Poggi](https://mattpoggi.github.io/), [Yiyi Liao](https://yiyiliao.github.io/ )
 
 ## 📢 News
+2024-12-03: Release inference code and checkpoint for new version <a href="https://huggingface.co/jhshao/ChronoDepth-v1"><img src="https://img.shields.io/badge/🤗%20Hugging%20Face-Model-green" height="16"></a>
 2024-06-11: Added <a href="https://huggingface.co/spaces/jhshao/ChronoDepth"><img src="https://img.shields.io/badge/🤗%20Hugging%20Face-Space-yellow" height="16"></a> - try it out with your videos for free!<br>2024-06-11: Added <a href="https://arxiv.org/abs/2406.01493"><img src="https://img.shields.io/badge/arXiv-PDF-b31b1b" height="16"></a> paper and inference code (this repository).
 
+
 ## 🛠️ Setup
-We test our codes under the following environment: `Ubuntu 20.04, Python 3.10.14, CUDA 11.3, RTX A6000`.
+We test our codes under the following environment: `Ubuntu 22.04, Python 3.10.15, CUDA 12.1, RTX A6000`.
 1. Clone this repository.
 ```bash
 git clone https://github.com/jhaoshao/ChronoDepth
@@ -19,7 +21,7 @@ cd ChronoDepth
 ```
 2. Install packages
 ```bash
-conda create -n chronodepth python=3.10
+conda create -n chronodepth python=3.10 -y
 conda activate chronodepth
 pip install -r requirements.txt
 ```
@@ -28,20 +30,25 @@ pip install -r requirements.txt
 Run the python script `run_infer.py` as follows
 ```bash
 python run_infer.py \
-    --model_base=jhshao/ChronoDepth \
-    --data_dir=assets/sora_e2.mp4 \
-    --output_dir=./outputs \
-    --num_frames=10 \
-    --denoise_steps=10 \
-    --window_size=9 \
-    --half_precision \
+    --unet=jhshao/ChronoDepth-v1 \
+    --model_base=stabilityai/stable-video-diffusion-img2vid-xt \
     --seed=1234 \
+    --data_dir=assets/elephant.mp4 \
+    --output_dir=./outputs \
+    --denoise_steps=5 \
+    --chunk_size=5 \
+    --n_tokens=10
 ```
 Inference settings:
-- `--num_frames`: sets the number of frames for each video clip.
-- `--denoise_steps`: sets the number of steps for the denoising process.
-- `--window_size`: sets the size of sliding window. This implies conducting separate inference when the sliding window size equals the number of frames.
-- `--half_precision`: enables running with half-precision (16-bit float). It might lead to suboptimal result but could speed up the inference process.
+- `--denoise_steps`: the number of steps for the denoising process.
+- `--chunk_size`: chunk size of sliding window for sliding window inference.
+- `--n_tokens`: number of frames of each clip for sliding window inference.
+
+## ✅ TODO
+- [x] Release inference code and checkpoint for new version
+- [] Set up Online demo for new version
+- [] Release evaluation code
+- [] Release training code & dataset preparation
 
 ## 🎓 Citation
 

@@ -6,10 +6,13 @@ import random
 from easydict import EasyDict
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
+import cv2
 import mediapy as media
-from tqdm.auto import tqdm
 
+from src.utils.video_utils import resize_max_res, colorize_video_depth
+from chronodepth.unet_chronodepth import DiffusersUNetSpatioTemporalConditionModelChronodepth
 from chronodepth.chronodepth_pipeline import ChronoDepthPipeline
 
 def seed_all(seed: int = 0):
@@ -21,24 +24,69 @@ def seed_all(seed: int = 0):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def read_video(video_path):
-    return media.read_video(video_path)
 
-def export_to_video(video_frames, output_video_path, fps):
-    media.write_video(output_video_path, video_frames, fps=fps)
+@torch.no_grad()
+def run_pipeline(pipe, cfg, video_rgb, generator, device):
+    """
+    Run the pipe on the input video.
+    args:
+        pipe: ChronoDepthPipeline object
+        cfg: config object
+        video_rgb: input video, torch.Tensor, shape [T, H, W, 3], range [0, 255]
+        generator: torch.Generator
+    returns:
+        video_depth_pred: predicted depth, torch.Tensor, shape [T, H, W], range [0, 1]
+    """
+    if isinstance(video_rgb, torch.Tensor):
+        video_rgb = video_rgb.cpu().numpy()
+
+    original_height = video_rgb.shape[1]
+    original_width = video_rgb.shape[2]
+
+    # resize the video to the max resolution
+    video_rgb = resize_max_res(video_rgb, cfg.max_res)
+
+    video_rgb = video_rgb.astype(np.float32) / 255.0
+    
+    pipe_out = pipe(
+        video_rgb,
+        num_inference_steps=cfg.denoise_steps,
+        decode_chunk_size=cfg.decode_chunk_size,
+        motion_bucket_id=127,
+        fps=7,
+        noise_aug_strength=0.0,
+        generator=generator,
+        infer_mode=cfg.infer_mode,
+        sigma_epsilon=cfg.sigma_epsilon,
+    )
+
+    depth_frames_pred = pipe_out.frames
+    depth_frames_pred = torch.from_numpy(depth_frames_pred).to(device)
+    depth_frames_pred = F.interpolate(depth_frames_pred, size=(original_height, original_width), mode="bilinear", align_corners=False)
+    depth_frames_pred = depth_frames_pred.clamp(0, 1)
+    depth_frames_pred = depth_frames_pred.squeeze(1)
+
+    return depth_frames_pred
+
 
 if "__main__" == __name__:
     logging.basicConfig(level=logging.INFO)
 
     # -------------------- Arguments --------------------
     parser = argparse.ArgumentParser(
-        description="Run single-image depth estimation using Marigold."
+        description="Run video depth estimation using ChronoDepth."
     )
 
     parser.add_argument(
+        "--unet",
+        type=str,
+        default="jhshao/ChronoDepth-v1",
+        help="Checkpoint path or hub name.",
+    )
+    parser.add_argument(
         "--model_base",
         type=str,
-        default="jhshao/ChronoDepth",
+        default="stabilityai/stable-video-diffusion-img2vid-xt",
         help="Checkpoint path or hub name.",
     )
 
@@ -46,51 +94,80 @@ if "__main__" == __name__:
     parser.add_argument(
         "--data_dir", type=str, required=True, help="input data directory."
     )
-
     parser.add_argument(
         "--output_dir", type=str, required=True, help="Output directory."
+    )
+    parser.add_argument(
+        "--grayscale",
+        action="store_true",
+        help="Whether save the output depth as grayscale.",
+    )
+    parser.add_argument(
+        "--save_npy",
+        action="store_true",
+        help="Whether save the output depth as npy.",
     )
 
     # inference setting
     parser.add_argument(
+        "--max_frames",
+        type=int,
+        default=None,
+        help="Max number of frames to process.",
+    )
+    parser.add_argument(
         "--denoise_steps",
         type=int,
-        default=10,  # quantitative evaluation uses 50 steps
+        default=5,  # quantitative evaluation uses 5 steps
         help="Diffusion denoising steps, more steps results in higher accuracy but slower inference speed.",
     )
     parser.add_argument(
-        "--half_precision",
-        action="store_true",
-        help="Run with half-precision (16-bit float), might lead to suboptimal result.",
+        "--infer_mode",
+        type=str,
+        default="ours",
+        help="Inference mode, options: naive, replacement, ours",
     )
     parser.add_argument(
-        "--num_frames",
+        "--chunk_size",
         type=int,
-        default=1,
-        help="Number of frames to infer per forward",
+        default=5, # quantitative evaluation uses 5
+        help="Chunk size of sliding window for inference.",
+    )
+    parser.add_argument(
+        "--n_tokens",
+        type=int,
+        default=10, # quantitative evaluation uses 10
+        help="number of frames of each clip for sliding window inference.",
+    )
+    parser.add_argument(
+        "--sigma_epsilon",
+        type=float,
+        default=-4.0, # quantitative evaluation uses -4.0
+        help="hyperparameter for diffusion denoising.",
+    )
+    parser.add_argument(
+        "--max_res",
+        type=int,
+        default=1024, # quantitative evaluation uses 1024
+        help="Max resolution of the input video during inference.",
     )
     parser.add_argument(
         "--decode_chunk_size",
         type=int,
-        default=1,
+        default=8,
         help="Number of frames to decode per forward",
     )
     parser.add_argument(
-        "--window_size",
-        type=int,
+        "--cpu_offload",
+        type=str,
         default=None,
-        help="Window size for inpaint inference",
+        help="Offload model to CPU to save memory, options: None, sequential, model",
     )
     
     parser.add_argument("--seed", type=int, default=None, help="Random seed.")
 
     args = parser.parse_args()
     cfg = EasyDict(vars(args))
-
-    if cfg.window_size is None or cfg.window_size == cfg.num_frames:
-        cfg.inpaint_inference = False
-    else:
-        cfg.inpaint_inference = True
 
     print(cfg)
 
@@ -117,157 +194,57 @@ if "__main__" == __name__:
     logging.info(f"output dir = {cfg.output_dir}")
 
     # -------------------- Model --------------------
-    if cfg.half_precision:
-        weight_dtype = torch.float16
-        logging.info(f"Running with half precision ({weight_dtype}).")
-    else:
-        weight_dtype = torch.float32
-
+    unet = DiffusersUNetSpatioTemporalConditionModelChronodepth.from_pretrained(
+            cfg.unet,
+            low_cpu_mem_usage=True,
+            torch_dtype=torch.float16,
+        )
     pipeline = ChronoDepthPipeline.from_pretrained(
                             cfg.model_base,
-                            torch_dtype=weight_dtype,
+                            unet=unet,
+                            torch_dtype=torch.float16,
+                            variant="fp16",
                         )
+    pipeline.n_tokens = cfg.n_tokens
+    pipeline.chunk_size = cfg.chunk_size
 
     try:
         pipeline.enable_xformers_memory_efficient_attention()
     except ImportError:
         logging.debug("run without xformers")
 
-    pipe = pipeline.to(device)
+    # for saving memory, we can offload the model to CPU, or even run the model sequentially to save more memory
+    if cfg.cpu_offload is not None:
+        if cfg.cpu_offload == "sequential":
+            # This will slow, but save more memory
+            pipeline.enable_sequential_cpu_offload()
+        elif cfg.cpu_offload == "model":
+            pipeline.enable_model_cpu_offload()
+        else:
+            raise ValueError(f"Unknown cpu offload option: {cfg.cpu_offload}")
+    else:
+        pipeline.to(device)
 
     # -------------------- data --------------------
-    data_ls = []
-    video_data = read_video(cfg.data_dir)
-    fps = video_data.metadata.fps
-    for i in tqdm(range(len(video_data)-cfg.num_frames+1)):
-        is_first_clip = i == 0
-        is_last_clip = i == len(video_data) - cfg.num_frames
-        is_new_clip = (
-            (cfg.inpaint_inference and i % cfg.window_size == 0)
-            or (cfg.inpaint_inference == False and i % cfg.num_frames == 0)
-        )
-        if is_first_clip or is_last_clip or is_new_clip:
-            data_ls.append(np.array(video_data[i: i+cfg.num_frames])) # [t, H, W, 3]
-
     video_name = cfg.data_dir.split('/')[-1].split('.')[0]
-    video_length = len(video_data)
+    video_data = media.read_video(cfg.data_dir)
     
-    depth_colored_pred = []
-    depth_pred = []
-    rgb_int_ls = []
+    fps = video_data.metadata.fps
+    video_rgb = np.array(video_data)
+    if cfg.max_frames is not None:
+        video_rgb = video_rgb[:cfg.max_frames]
+    
     # -------------------- Inference and saving --------------------
-    with torch.no_grad():
-        for iter, batch in enumerate(tqdm(
-            data_ls, desc=f"Inferencing on {cfg.data_dir}", leave=True
-        )):
-            rgb_int = batch
-            input_images = [Image.fromarray(rgb_int[i]) for i in range(cfg.num_frames)]
+    video_depth_pred = run_pipeline(pipeline, cfg, video_rgb, generator, device) # range [0, 1]
 
-            # Predict depth
-            if iter == 0: # First clip:
-                pipe_out = pipeline(
-                    input_images,
-                    num_frames=len(input_images),
-                    num_inference_steps=cfg.denoise_steps,
-                    decode_chunk_size=cfg.decode_chunk_size,
-                    motion_bucket_id=127,
-                    fps=7,
-                    noise_aug_strength=0.0,
-                    generator=generator,
-                )
-            elif cfg.inpaint_inference and (iter == len(data_ls) - 1): # temporal inpaint inference for last clip
-                last_window_size = cfg.window_size if video_length%cfg.window_size == 0 else video_length%cfg.window_size
-                pipe_out = pipeline(
-                    input_images,
-                    num_frames=cfg.num_frames,
-                    num_inference_steps=cfg.denoise_steps,
-                    decode_chunk_size=cfg.decode_chunk_size,
-                    motion_bucket_id=127,
-                    fps=7,
-                    noise_aug_strength=0.0,
-                    generator=generator,
-                    depth_pred_last=depth_frames_pred_ts[last_window_size:],
-                )
-            elif cfg.inpaint_inference and iter > 0: # temporal inpaint inference
-                pipe_out = pipeline(
-                    input_images,
-                    num_frames=cfg.num_frames,
-                    num_inference_steps=cfg.denoise_steps,
-                    decode_chunk_size=cfg.decode_chunk_size,
-                    motion_bucket_id=127,
-                    fps=7,
-                    noise_aug_strength=0.0,
-                    generator=generator,
-                    depth_pred_last=depth_frames_pred_ts[cfg.window_size:],
-                )
-            else: # Separate inference
-                pipe_out = pipeline(
-                    input_images,
-                    num_frames=cfg.num_frames,
-                    num_inference_steps=cfg.denoise_steps,
-                    decode_chunk_size=cfg.decode_chunk_size,
-                    motion_bucket_id=127,
-                    fps=7,
-                    noise_aug_strength=0.0,
-                    generator=generator,
-                )
+    if cfg.grayscale:
+        colored_depth_video = video_depth_pred.cpu().numpy() * 255
+        colored_depth_video = np.repeat(colored_depth_video[:, :, :, None], 3, axis=3)
+        colored_depth_video = colored_depth_video.astype(np.uint8)
+    else:
+        colored_depth_video = colorize_video_depth(video_depth_pred)
 
-            depth_frames_pred = [pipe_out.depth_np[i] for i in range(cfg.num_frames)]
+    media.write_video(f"{cfg.output_dir}/{video_name}_depth.mp4", colored_depth_video, fps=fps)
 
-            depth_frames_colored_pred = []
-            for i in range(cfg.num_frames):
-                depth_frame_colored_pred = np.array(pipe_out.depth_colored[i])
-                depth_frames_colored_pred.append(depth_frame_colored_pred)
-            depth_frames_colored_pred = np.stack(depth_frames_colored_pred, axis=0)
-
-            depth_frames_pred = np.stack(depth_frames_pred, axis=0)
-            depth_frames_pred_ts = torch.from_numpy(depth_frames_pred).to(device)
-            depth_frames_pred_ts = depth_frames_pred_ts * 2 - 1
-
-            if cfg.inpaint_inference == False:
-                if iter == len(data_ls) - 1:
-                    last_window_size = cfg.num_frames if video_length%cfg.num_frames == 0 else video_length%cfg.num_frames
-                    rgb_int_ls.append(rgb_int[-last_window_size:])
-                    depth_colored_pred.append(depth_frames_colored_pred[-last_window_size:])
-                    depth_pred.append(depth_frames_pred[-last_window_size:])
-                else:
-                    rgb_int_ls.append(rgb_int)
-                    depth_colored_pred.append(depth_frames_colored_pred)
-                    depth_pred.append(depth_frames_pred)
-            else:
-                if iter == 0:
-                    rgb_int_ls.append(rgb_int)
-                    depth_colored_pred.append(depth_frames_colored_pred)
-                    depth_pred.append(depth_frames_pred)
-                elif iter == len(data_ls) - 1:
-                    rgb_int_ls.append(rgb_int[-last_window_size:])
-                    depth_colored_pred.append(depth_frames_colored_pred[-last_window_size:])
-                    depth_pred.append(depth_frames_pred[-last_window_size:])
-                else:
-                    rgb_int_ls.append(rgb_int[-cfg.window_size:])
-                    depth_colored_pred.append(depth_frames_colored_pred[-cfg.window_size:])
-                    depth_pred.append(depth_frames_pred[-cfg.window_size:])
-
-    rgb_int_ls = np.concatenate(rgb_int_ls, axis=0)
-    depth_colored_pred = np.concatenate(depth_colored_pred, axis=0)
-    depth_pred = np.concatenate(depth_pred, axis=0)
-
-    # -------------------- Save results --------------------
-    output_dir_video = os.path.join(cfg.output_dir, video_name)
-    os.makedirs(output_dir_video, exist_ok=True)
-
-    # # Save images
-    # rgb_dir = os.path.join(output_dir_video, "rgb")
-    # depth_colored_dir = os.path.join(output_dir_video, "depth_colored")
-    # depth_pred_dir = os.path.join(output_dir_video, "depth_pred")
-    # os.makedirs(rgb_dir, exist_ok=True)
-    # os.makedirs(depth_colored_dir, exist_ok=True)
-    # os.makedirs(depth_pred_dir, exist_ok=True)
-    # for i in tqdm(range(len(rgb_int_ls))):
-    #     Image.fromarray(rgb_int_ls[i]).save(os.path.join(rgb_dir, f"frame_{i:06d}.png"))     
-    #     Image.fromarray(depth_colored_pred[i]).save(os.path.join(depth_colored_dir, f"frame_{i:06d}.png"))
-    #     np.save(os.path.join(depth_pred_dir, f"frame_{i:06d}.npy"), depth_pred[i])
-
-    # Export to video
-    export_to_video(rgb_int_ls, os.path.join(output_dir_video , f"{video_name}_rgb_clipFrames{cfg.num_frames}_ws{cfg.window_size}.mp4"), fps)
-    export_to_video(depth_colored_pred, os.path.join(output_dir_video , f"{video_name}_depth_clipFrame{cfg.num_frames}_ws{cfg.window_size}.mp4"), fps)
+    if cfg.save_npy:
+        np.save(f"{cfg.output_dir}/{video_name}_depth.npy", video_depth_pred.cpu().numpy())
