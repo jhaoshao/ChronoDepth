@@ -46,9 +46,9 @@ Inference settings:
 
 ## ✅ TODO
 - [x] Release inference code and checkpoint for new version
-- [] Set up Online demo for new version
-- [] Release evaluation code
-- [] Release training code & dataset preparation
+- [ ] Set up Online demo for new version
+- [ ] Release evaluation code
+- [ ] Release training code & dataset preparation
 
 ## 🎓 Citation
 
