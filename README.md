@@ -38,12 +38,14 @@ python run_infer.py \
     --output_dir=./outputs \
     --denoise_steps=5 \
     --chunk_size=5 \
-    --n_tokens=10
+    --n_tokens=10 \
+    --sigma_epsilon=-4.0
 ```
-Inference settings:
+Some important inference settings below:
 - `--denoise_steps`: the number of steps for the denoising process.
 - `--chunk_size`: chunk size of sliding window for sliding window inference.
 - `--n_tokens`: number of frames of each clip for sliding window inference.
+- `--sigma_epsilon`: hyperparameter for our context-aware diffusion denoising.
 
 ## ✅ TODO
 - [x] Release inference code and checkpoint for new version
