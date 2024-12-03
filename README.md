@@ -56,12 +56,13 @@ Inference settings:
 Please cite our paper if you find this repository useful:
 
 ```bibtex
-@misc{shao2024learning,
+@misc{shao2024learningtemporallyconsistentvideo,
       title={Learning Temporally Consistent Video Depth from Video Diffusion Priors}, 
-      author={Jiahao Shao and Yuanbo Yang and Hongyu Zhou and Youmin Zhang and Yujun Shen and Matteo Poggi and Yiyi Liao},
+      author={Jiahao Shao and Yuanbo Yang and Hongyu Zhou and Youmin Zhang and Yujun Shen and Vitor Guizilini and Yue Wang and Matteo Poggi and Yiyi Liao},
       year={2024},
       eprint={2406.01493},
       archivePrefix={arXiv},
-      primaryClass={cs.CV}
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2406.01493}, 
 }
 ```
